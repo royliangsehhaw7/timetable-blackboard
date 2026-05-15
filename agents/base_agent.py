@@ -24,7 +24,8 @@ class BaseAgent(ABC):
         ...
 
     @abstractmethod
-    def get_instruction(self) -> str: ...
+    def get_instruction(self) -> str: 
+        ...
 
     def get_failure_prompt(self, failure_context: str) -> str:
         return (

@@ -1,18 +1,21 @@
-from __future__ import annotations
-from agents.base_agent import BaseAgent
-from blackboard.blackboard import BlackBoard
+from pydantic_ai import Agent
+
+
 from core.deps import Deps
+from agents.base_agent import BaseAgent
+
+from blackboard.blackboard import BlackBoard
 from schemas.timetable import Proposal
 
 
 class PolicyAgent(BaseAgent):
-    def __init__(self, name: str):
-        super().__init__(name, agent=None)
-
+    def __init__(self, name: str, agent: Agent = None):
+        super().__init__(name, agent) 
     def is_competent_for(self, board: BlackBoard) -> Proposal | None:
         return next(
             (p for p in board.get_proposals()
-             if p.lecturer_id is not None and p.policy_approved is None),
+                # if p.lecturer_id is not None and p.policy_approved is None),
+                if p.room_id is not None and p.policy_approved is None),
             None,
         )
 
@@ -28,7 +31,7 @@ class PolicyAgent(BaseAgent):
         policy   = deps.policy
         course   = next(c for c in deps.courses   if c.id == proposal.course_id)
         room     = next(r for r in deps.rooms      if r.id == proposal.room_id)
-        lecturer = next(l for l in deps.lecturers  if l.id == proposal.lecturer_id)
+        # lecturer = next(l for l in deps.lecturers  if l.id == proposal.lecturer_id)
         slot     = proposal.timeslot
 
         
@@ -45,8 +48,8 @@ class PolicyAgent(BaseAgent):
         if course.requires_lab and room.room_type != "lab":
             return False, f"Course requires a lab but {room.name} is a {room.room_type}", "room"
 
-        if proposal.course_id not in lecturer.courses_taught:
-            return False, f"{lecturer.name} is not qualified to teach this course", "lecturer"
+        # if proposal.course_id not in lecturer.courses_taught:
+        #     return False, f"{lecturer.name} is not qualified to teach this course", "lecturer"
 
         if any(s.day == slot.day and s.start_hour == slot.start_hour
                for s in lecturer.unavailable_slots):
@@ -59,10 +62,10 @@ class PolicyAgent(BaseAgent):
             other = room_conflicts[0].course_id
             return False, f"{room.name} already claimed by in-flight proposal for {other}", "room"
 
-        lecturer_conflicts = deps.board.get_lecturer_conflicts(proposal)
-        if lecturer_conflicts:
-            other = lecturer_conflicts[0].course_id
-            return False, f"{lecturer.name} already claimed by in-flight proposal for {other}", "lecturer"
+        # lecturer_conflicts = deps.board.get_lecturer_conflicts(proposal)
+        # if lecturer_conflicts:
+        #     other = lecturer_conflicts[0].course_id
+        #     return False, f"{lecturer.name} already claimed by in-flight proposal for {other}", "lecturer"
 
         return True, None, None
 

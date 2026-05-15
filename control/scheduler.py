@@ -42,11 +42,29 @@ class Scheduler:
 
             # agents self-select — first competent agent activates
             for agent in self._agents:
-                if proposal := agent.is_competent_for(board):
-                    logger.info(f"[cycle {cycle}] {agent.name} self-activated "
-                                f"for {proposal.course_id}")
-                    await agent.run(proposal, deps)
-                    break
+                # if proposal := agent.is_competent_for(board):
+                #     logger.info(f"[cycle {cycle}] {agent.name} self-activated "
+                #                 f"for {proposal.course_id}")
+                #     await agent.run(proposal, deps)
+                #     break
+                # 1. Find the proposal first
+                selected_proposal = None
+                selected_agent = None
+
+                for agent in self._agents:
+                    proposal = agent.is_competent_for(board)
+                    if proposal:
+                        selected_proposal = proposal
+                        selected_agent = agent
+                        break  # Exit the loop once we find a match
+
+                # 2. Execute based on the result
+                if selected_agent and selected_proposal:
+                    logger.info(
+                        f"[cycle {cycle}] {selected_agent.name} self-activated "
+                        f"for {selected_proposal.course_id}"
+                    )
+                    await selected_agent.run(selected_proposal, deps)        
 
         return self._produce_output(deps, cycle)
 

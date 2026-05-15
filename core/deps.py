@@ -1,4 +1,7 @@
 from dataclasses import dataclass
+
+from blackboard.blackboard import BlackBoard
+
 from schemas.course import Course
 from schemas.room import Room
 from schemas.lecturer import Lecturer

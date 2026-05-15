@@ -20,15 +20,17 @@ class RoomAgent(BaseAgent):
         )
 
     def get_instruction(self) -> str:
-        return (
-            "You are the RoomAgent in a timetable scheduling system.\n"
-            "Your sole job is to assign the most suitable room for a course proposal.\n\n"
-            "Rules:\n"
-            "- Match room type to course requirement (lab → lab room, non-lab → classroom)\n"
-            "- Never assign a room already confirmed at this timeslot\n"
-            "- Never assign a room already claimed by another in-progress proposal at this timeslot\n"
-            "- If multiple suitable rooms are free, prefer the best fit\n\n"
-            "Call log_decision to explain your reasoning. Return the proposal with room_id set."
+        return (f"""
+                You are the RoomAgent in a timetable scheduling system.
+                Your sole job is to assign the most suitable room for a course proposal.
+                Rules:
+                - Match room type to course requirement (lab → lab room, non-lab → classroom)
+                - Never assign a room already confirmed at this timeslot
+                - Never assign a room already claimed by another in-progress proposal at this timeslot
+                - If multiple suitable rooms are free, prefer the best fit
+                
+                Call log_decision to explain your reasoning. Return the proposal with room_id set.
+            """
         )
 
     def get_prompt(self, proposal: Proposal, deps: Deps) -> str:
@@ -39,17 +41,19 @@ class RoomAgent(BaseAgent):
         ]
         in_conflict = deps.board.get_room_conflicts(proposal)
 
-        prompt = (
-            f"Current proposal:\n{json.dumps(proposal.model_dump(), indent=2)}\n\n"
-            f"Course:\n{json.dumps(course.model_dump(), indent=2)}\n\n"
-            f"All rooms:\n{json.dumps([r.model_dump() for r in deps.rooms], indent=2)}\n\n"
-            f"Rooms confirmed at this timeslot:\n"
-            f"{json.dumps([a.model_dump() for a in confirmed], indent=2)}\n\n"
-            f"Rooms already claimed by other in-progress proposals at this timeslot:\n"
-            f"{json.dumps([p.room_id for p in in_conflict], indent=2)}"
+        prompt = (f"""
+                Current proposal:\n{json.dumps(proposal.model_dump(), indent=2)}
+                Course:\n{json.dumps(course.model_dump(), indent=2)}
+                All rooms:\n{json.dumps([r.model_dump() for r in deps.rooms], indent=2)}
+                Rooms confirmed at this timeslot:
+                {json.dumps([a.model_dump() for a in confirmed], indent=2)}
+                Rooms already claimed by other in-progress proposals at this timeslot:
+                {json.dumps([p.room_id for p in in_conflict], indent=2)}
+            """
         )
         if proposal.failure_context:
             prompt += f"\n\n{self.get_failure_prompt(proposal.failure_context)}"
+
         return prompt
 
     async def run(self, proposal: Proposal, deps: Deps) -> None:
@@ -58,4 +62,5 @@ class RoomAgent(BaseAgent):
             deps=deps,
             instructions=self.get_instruction(),
         )
-        deps.board.update_proposal(result.data)
+
+        deps.board.update_proposal(result.output)
