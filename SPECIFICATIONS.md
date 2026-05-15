@@ -1,5 +1,5 @@
 # Multi-Agent Timetable Generation System
-## Specification v2.0 — Blackboard / Competency-Based Role Pattern
+## Specification v3.0 — Blackboard / Competency-Based Role Pattern (Revised)
 
 ---
 
@@ -9,20 +9,26 @@ A learning-oriented multi-agent system that generates a valid weekly school time
 goal is to understand and implement the **Blackboard Pattern with Competency-Based Roles** in a
 grounded, practical context using pydantic-ai's deps, agents, and tools features properly.
 
-The timetable domain is intentionally simple. It exists to make emergent self-activation visible and
-traceable, not to solve a hard scheduling problem.
+**What is different from v2.0:**
 
-**What is different from v1.0 (Orchestrator-Worker):**
+v2.0 had three structural problems that undermined the blackboard pattern:
 
-In v1.0, a central orchestrator read full state every cycle and told each worker when to act.
-Workers were passive — they waited to be dispatched.
+1. **The board did domain reasoning.** `get_timeslot_conflicts()`, `get_room_conflicts()`, and
+   `get_lecturer_conflicts()` are domain logic — conflict reasoning about scheduling. A blackboard
+   is a dumb data store. Domain reasoning belongs in the agents that own it.
 
-In v2.0, there is no orchestrator. Each agent owns its activation condition. The blackboard holds
-all shared state. A thin scheduler loop asks every agent every cycle whether its preconditions are
-met. If they are, the agent activates itself, does its domain work, and writes back to the
-blackboard. The sequential order of scheduling — timeslot before room, room before lecturer,
-lecturer before policy — is preserved, but it emerges from data readiness on the blackboard, not
-from an external dispatcher.
+2. **`Proposal` was a state machine, not a schema.** It contained `apply_rejection()`,
+   `_reset_timeslot/room/lecturer`, and a `_RESET_STRATEGY` dispatch dict. A Pydantic `BaseModel`
+   describes data shape. Lifecycle and mutation logic belongs in the component that manages
+   lifecycle — the Scheduler.
+
+3. **LLM agents received pre-filtered context instead of reading the board.** True blackboard
+   agents walk up to the board and read what they need. The board should expose raw state; agents
+   decide what is relevant to their competency.
+
+v3.0 corrects all three. The blackboard is a pure data store. `Proposal` is a pure schema.
+The Scheduler owns all lifecycle transitions. Agents read raw board state and apply their own
+domain reasoning.
 
 ---
 
@@ -34,12 +40,12 @@ This system implements the **Blackboard Pattern with Competency-Based Roles**.
 
 A shared `BlackBoard` object holds all system state — proposals in progress, confirmed assignments,
 rejection history, and unscheduled course ids. Every agent reads directly from the blackboard and
-writes directly back to it. No coordinator mediates these reads or writes.
+writes directly back to it. No coordinator mediates these reads or writes. The blackboard does not
+reason about its own contents.
 
 Each agent defines its own **competency guard** — a method that inspects the blackboard and returns
 the proposal it should work on, or `None` if no work is currently relevant. The scheduler loop
-calls every agent's guard every cycle. Whichever agent finds relevant work activates itself. The
-rest stay idle.
+calls every agent's guard every cycle. Whichever agent finds relevant work activates itself.
 
 The sequential constraint of the scheduling pipeline — timeslot → room → lecturer → policy — is
 enforced by each agent's guard condition, not by external dispatch:
@@ -53,16 +59,13 @@ No agent is told to go. Each agent decides for itself whether it is relevant to 
 
 ### 2.2 The Blackboard
 
-The `BlackBoard` is the single source of truth. It replaces the `Store` from v1.0 and expands it
-to include in-progress proposals. All agents read from it. All agents write to it. The scheduler
-loop also writes to it (confirm, abandon).
-
-The blackboard is not a message bus. Agents do not send messages to each other. They leave state on
-the board and trust that the relevant agent will notice and act.
+The `BlackBoard` is the single source of truth and a **pure data store**. It holds state. It does
+not compute conflicts, filter proposals by agent type, or make any domain decisions. All agents
+read raw state from it and apply their own domain logic locally.
 
 ### 2.3 Agents
 
-There are four pydantic-ai agents. The orchestrator from v1.0 is removed entirely.
+There are four agents. There is no orchestrator.
 
 | Agent | Competency — activates when |
 |---|---|
@@ -71,57 +74,65 @@ There are four pydantic-ai agents. The orchestrator from v1.0 is removed entirel
 | `LecturerAgent` | A proposal exists with a room_id but no lecturer_id |
 | `PolicyAgent` | A proposal exists that is fully assembled but policy not yet evaluated |
 
-All four share a common `BaseAgent`. The `PolicyAgent` is a Python function — not an LLM call —
-because policy checking is fully deterministic (see section 8.5).
+`CourseAgent`, `RoomAgent`, and `LecturerAgent` are LLM-powered. `PolicyAgent` is pure Python —
+policy checking is fully deterministic.
+
+Each agent reads raw proposals from the board, applies its own conflict reasoning, constructs its
+own context, calls the LLM (or runs Python), and writes back to the board directly.
 
 ### 2.4 Flow
-
-Every cycle follows the same structure: the scheduler reads the board, asks each agent if it has
-work, activates the first one that does, and repeats.
 
 ```
 LOOP:
     board state snapshot logged
 
-    if no unscheduled courses and no active proposals → done
+    if board.is_complete() → done
 
-    if active proposal retry_count >= MAX_RETRIES → abandon proposal, write to board
+    for each in-flight proposal:
+        if retry_count >= MAX_RETRIES → scheduler abandons it
+        if policy_approved is True   → scheduler confirms it
+        if policy_approved is False  → scheduler resets it (see 2.5)
+
+    board.ensure_proposals_exist()   # one new proposal per cycle if needed
 
     for each agent in [CourseAgent, RoomAgent, LecturerAgent, PolicyAgent]:
         proposal = agent.is_competent_for(board)
         if proposal:
-            agent.run(proposal, board, deps)   # agent reads board, writes back to board
-            break                              # one agent activates per cycle
-
-    if no agent activated and unscheduled courses remain:
-        create new Proposal for next unscheduled course, write to board
+            await agent.run(proposal, deps)   # agent reads board, writes back
+            break                             # one agent activates per cycle
 ```
-
-**What each agent's guard checks:**
-
-- `CourseAgent.is_competent_for(board)` — finds any proposal where `timeslot is None`
-- `RoomAgent.is_competent_for(board)` — finds any proposal where `timeslot is set` and `room_id is None`
-- `LecturerAgent.is_competent_for(board)` — finds any proposal where `room_id is set` and `lecturer_id is None`
-- `PolicyAgent.is_competent_for(board)` — finds any proposal where `lecturer_id is set` and `policy_approved is None`
-
-**What happens after each agent runs:**
-
-- `CourseAgent` — writes proposal with `timeslot` set back to board
-- `RoomAgent` — writes proposal with `room_id` set back to board
-- `LecturerAgent` — writes proposal with `lecturer_id` set back to board
-- `PolicyAgent` — writes proposal with `policy_approved` and `policy_reason` set back to board; if approved, scheduler confirms it; if rejected, scheduler increments `retry_count` and resets the responsible field so the right agent re-activates
 
 ### 2.5 Failure Recovery
 
 When `PolicyAgent` rejects a proposal it sets `policy_approved=False`, `policy_reason` with a
-specific failure description, and `failed_component` with one of `"timeslot"`, `"room"`,
-`"lecturer"`. The scheduler reads `failed_component` and resets the corresponding field on the
-proposal to `None`, then increments `retry_count`. On the next cycle, the agent responsible for
-that field will find the proposal via its guard and re-activate with the `failure_context` from
-`policy_reason`.
+description, and `failed_component` with one of `"timeslot"`, `"room"`, `"lecturer"`.
 
-This is not dispatch. The scheduler does not choose which agent to call. It resets a field. The
-agent whose guard matches that field self-activates on the next cycle.
+The **Scheduler** reads these fields and resets the proposal accordingly:
+
+```python
+if proposal.failed_component == "timeslot":
+    proposal.timeslot    = None
+    proposal.room_id     = None
+    proposal.lecturer_id = None
+elif proposal.failed_component == "room":
+    proposal.room_id     = None
+    proposal.lecturer_id = None
+elif proposal.failed_component == "lecturer":
+    proposal.lecturer_id = None
+
+proposal.failure_context  = proposal.policy_reason
+proposal.retry_count     += 1
+proposal.policy_approved  = None
+proposal.policy_reason    = None
+proposal.failed_component = None
+
+board.update_proposal(proposal)
+```
+
+This reset logic lives entirely in the Scheduler. `Proposal` does not mutate itself.
+
+On the next cycle, the agent whose guard matches the reset field self-activates and receives
+`failure_context` from the proposal it finds on the board.
 
 ### 2.6 What no agent does
 
@@ -167,12 +178,7 @@ timetable/
 └── main.py
 ```
 
-**Differences from v1.0:**
-
-- `store/store.py` is removed — replaced by `blackboard/blackboard.py`
-- `control/coordinator.py` is removed — replaced by `control/scheduler.py`
-- `agents/orchestrator_agent.py` is removed entirely
-- All other files retain the same location
+No structural changes from v2.0. All file locations are identical.
 
 ---
 
@@ -248,72 +254,32 @@ class Proposal(BaseModel):
     failure_context: str | None = None
     retry_count: int = 0
 
-    # ── state predicates — the scheduler reads only these ─────────────────────
 
-    @property
-    def is_confirmed(self) -> bool:
-        return self.policy_approved is True
+class Assignment(BaseModel):
+    course_id: str
+    room_id: str
+    lecturer_id: str
+    timeslot: TimeSlot
+    cycle: int
 
-    @property
-    def is_rejected(self) -> bool:
-        return self.policy_approved is False
 
-    @property
-    def is_exhausted(self) -> bool:
-        return self.retry_count >= MAX_RETRIES
-
-    # ── self-repair — proposal owns its own field topology ────────────────────
-
-    def apply_rejection(self) -> None:
-        """
-        Reset this proposal back to the stage that failed.
-        The scheduler calls this without knowing what it does internally.
-        The correct agent self-activates on the next cycle because its
-        guard condition will match the reset state.
-        """
-        component = self.failed_component
-
-        self.failure_context  = self.policy_reason
-        self.retry_count     += 1
-        self.policy_approved  = None
-        self.policy_reason    = None
-        self.failed_component = None
-
-        _RESET_STRATEGY[component](self)
-
-    def _reset_timeslot(p: Proposal) -> None:
-        p.timeslot    = None
-        p.room_id     = None
-        p.lecturer_id = None
-
-    def _reset_room(p: Proposal) -> None:
-        p.room_id     = None
-        p.lecturer_id = None
-
-    def _reset_lecturer(p: Proposal) -> None:
-        p.lecturer_id = None
-
-    _RESET_STRATEGY: dict[str | None, callable] = {
-        "timeslot": _reset_timeslot,
-        "room":     _reset_room,
-        "lecturer": _reset_lecturer,
-}
+class RejectionRecord(BaseModel):
+    course_id: str
+    reason: str
+    cycle: int
 ```
 
-**Changes from v1.0:**
+**Key change from v2.0:** `Proposal` is a pure data schema. All state predicates (`is_confirmed`,
+`is_rejected`, `is_exhausted`) and all mutation methods (`apply_rejection`, `_reset_*`,
+`_RESET_STRATEGY`) are removed. The Scheduler reads `policy_approved`, `retry_count`, and
+`failed_component` directly and handles all transitions itself.
 
-- `OrchestratorDecision` is removed — no orchestrator exists
-- `Proposal` gains two fields:
-  - `failed_component` — the structured rejection target set by `PolicyAgent` (`"timeslot"`, `"room"`, or `"lecturer"`). Enables the scheduler to reset the correct field without LLM reasoning.
-  - `failure_context` — free-text context copied from `policy_reason` by the scheduler and passed to the re-activating agent as a correction hint.
+**Invariant**: `Proposal` has no methods beyond what Pydantic provides. No mutation, no self-repair,
+no strategy dispatch.
 
-**Verification**: import each schema in a scratch script and instantiate one instance per model with
-dummy data. All fields should round-trip through `model_dump()` and `model_validate()` without
+**Verification**: import each schema in a scratch script and instantiate one instance per model
+with dummy data. All fields should round-trip through `model_dump()` and `model_validate()` without
 error. Confirm `failed_component` and `failure_context` default to `None`.
-
-**Invariant**: the scheduler must never read policy_approved, retry_count, failed_component,
-timeslot, room_id, or lecturer_id directly. It reads only is_confirmed, is_rejected, and
-is_exhausted. All field knowledge lives inside Proposal.
 
 ---
 
@@ -321,31 +287,35 @@ is_exhausted. All field knowledge lives inside Proposal.
 
 **Location**: `blackboard/blackboard.py`
 
-The blackboard is the shared knowledge base. It replaces the `Store` from v1.0. All agents read
-from it directly and write to it directly. The scheduler also reads and writes to it for lifecycle
-operations (confirm, abandon, new proposal creation).
-
-Unlike the v1.0 Store — which was a write-only surface for the coordinator — the blackboard is a
-read/write surface for every participant in the system. This is the defining characteristic of the
-Blackboard pattern.
+The blackboard is the shared knowledge base and a **pure data store**. It holds raw state. It
+does not compute conflicts, filter by agent, or reason about its contents in any way. Agents read
+raw state and apply their own domain logic.
 
 ### 5.1 What it holds
 
 ```python
 class BlackBoard:
     def __init__(self):
-        self._proposals: dict[str, Proposal] = {}         # keyed by proposal.id
+        self._proposals: dict[str, Proposal] = {}
         self._assignments: list[Assignment] = []
         self._rejection_log: list[RejectionRecord] = []
         self._unscheduled_courses: list[str] = []
+
+    def is_complete(self) -> bool:
+        return not self._unscheduled_courses and not self._proposals
+
+    def ensure_proposals_exist(self, cycle: int) -> None:
+        in_flight = {p.course_id for p in self._proposals.values()}
+        for course_id in self._unscheduled_courses:
+            if course_id not in in_flight:
+                self.add_proposal(Proposal(id=str(uuid.uuid4()), course_id=course_id))
+                return
 ```
 
-`_proposals` holds all in-progress proposals. In v1.0, in-flight proposals lived as a local
-variable in the coordinator loop. In v2.0, they live on the blackboard, visible to every agent.
-Multiple proposals can coexist on the board (one per unscheduled course), though in this system
-only one is in progress at any time.
-
-`_unscheduled_courses` is seeded at startup. A course id is removed when confirmed or abandoned.
+**Key change from v2.0:** `get_timeslot_conflicts()`, `get_room_conflicts()`, and
+`get_lecturer_conflicts()` are removed entirely. These were domain logic — conflict reasoning about
+scheduling — which does not belong in a data store. Each agent reads raw proposals from the board
+and computes conflicts itself as part of its domain work.
 
 ### 5.2 Methods
 
@@ -353,40 +323,37 @@ only one is in progress at any time.
 
 | Method | Signature | What it does |
 |---|---|---|
-| `seed` | `(course_ids: list[str]) -> None` | Populates `_unscheduled_courses` at startup. Called once before the scheduler loop begins. |
+| `seed` | `(course_ids: list[str]) -> None` | Populates `_unscheduled_courses` at startup. |
 
 #### Proposal lifecycle
 
 | Method | Signature | What it does |
 |---|---|---|
-| `add_proposal` | `(proposal: Proposal) -> None` | Adds a new in-progress proposal to the board. Called by the scheduler when starting a new course. |
-| `update_proposal` | `(proposal: Proposal) -> None` | Replaces the existing proposal with the same id. Called by agents after they complete their domain work. |
-| `confirm_proposal` | `(proposal: Proposal, cycle: int) -> None` | Constructs an `Assignment`, appends to `_assignments`, removes `course_id` from `_unscheduled_courses`, removes proposal from `_proposals`. |
-| `abandon_proposal` | `(proposal: Proposal, reason: str, cycle: int) -> None` | Appends a `RejectionRecord`, removes `course_id` from `_unscheduled_courses`, removes proposal from `_proposals`. |
+| `add_proposal` | `(proposal: Proposal) -> None` | Adds a new in-progress proposal. |
+| `update_proposal` | `(proposal: Proposal) -> None` | Replaces the existing proposal with the same id. |
+| `confirm_proposal` | `(proposal: Proposal, cycle: int) -> None` | Constructs an `Assignment`, removes course from unscheduled, removes proposal. |
+| `abandon_proposal` | `(proposal: Proposal, reason: str, cycle: int) -> None` | Appends a `RejectionRecord`, removes course from unscheduled, removes proposal. |
 
 #### Read methods
 
 | Method | Signature | What it returns |
 |---|---|---|
-| `get_proposals` | `() -> list[Proposal]` | All in-progress proposals. |
+| `get_proposals` | `() -> list[Proposal]` | All in-progress proposals. Raw — no filtering. |
 | `get_assignments` | `() -> list[Assignment]` | All confirmed assignments. |
 | `get_rejection_log` | `() -> list[RejectionRecord]` | Full rejection history. |
 | `get_unscheduled_courses` | `() -> list[str]` | Course ids not yet confirmed or abandoned. |
 
-No domain logic lives in the blackboard. No routing. No filtering by agent. Just reads and writes.
+No domain logic lives in the blackboard. No routing. No conflict detection. Just reads and writes.
 
-**Verification**: seed with three course ids. Add two proposals. Update one. Confirm one proposal
-and verify it appears in assignments and is removed from proposals and unscheduled. Abandon one and
-verify rejection log is updated. Print all collections after each operation.
+**Verification**: seed with three course ids. Add two proposals. Update one. Confirm one and verify
+it appears in assignments and is removed from proposals and unscheduled. Abandon one and verify
+rejection log is updated. Print all collections after each operation.
 
 ---
 
 ## 6. Dependencies — Deps and RunContext
 
 ### 6.1 What Deps holds
-
-`Deps` is a single container passed into every agent activation. It holds the blackboard (shared
-mutable state) and the reference data (read-only).
 
 ```python
 @dataclass
@@ -396,12 +363,8 @@ class Deps:
     rooms: list[Room]            # read-only reference data
     lecturers: list[Lecturer]    # read-only reference data
     policy: Policy               # read-only reference data
-    total_tokens: int = 0        # accumulated token usage across all agents
+    total_tokens: int = 0
 ```
-
-**Change from v1.0:** `store: Store` is replaced by `board: BlackBoard`. Agents now have direct
-access to the blackboard through `deps.board`. This is intentional — agents in a blackboard system
-read and write shared state themselves, they do not receive pre-filtered context from a coordinator.
 
 ### 6.2 How Deps flows at runtime
 
@@ -415,15 +378,13 @@ usage into `deps.total_tokens`.
 
 ### 7.1 Design decision
 
-There is one tool in this system: `log_decision`. It is registered on all LLM-powered agents.
+There is one tool: `log_decision`. It is registered on all LLM-powered agents. A tool is something
+the LLM calls mid-reasoning to perform an action with a side effect. `log_decision` qualifies: the
+LLM triggers it deliberately to narrate its reasoning, and it produces structured log output and
+accumulates token counts as side effects.
 
-A tool is something the LLM calls mid-reasoning to perform an action with a side effect.
-`log_decision` qualifies: the LLM triggers it deliberately to narrate its reasoning, and it
-produces structured log output and accumulates token counts as side effects.
-
-Blackboard writes (update_proposal, confirm_proposal, abandon_proposal) happen inside each agent's
-`run()` method or inside the scheduler after reading the returned proposal. They are not tools
-because they are deterministic Python operations, not LLM-triggered mid-reasoning actions.
+Blackboard writes happen inside each agent's `run()` method or inside the Scheduler. They are not
+tools because they are deterministic Python operations, not LLM-triggered actions.
 
 ### 7.2 The tool
 
@@ -452,9 +413,6 @@ async def log_decision(ctx: RunContext[Deps], message: str) -> str:
 
 ### 7.3 Tool registration per agent
 
-`log_decision` is registered on the three LLM-powered agents. `PolicyAgent` is a Python function
-and does not use it.
-
 | Tool | CourseAgent | RoomAgent | LecturerAgent | PolicyAgent |
 |---|:---:|:---:|:---:|:---:|
 | `log_decision` | ✓ | ✓ | ✓ | — |
@@ -465,27 +423,24 @@ and does not use it.
 
 ### 8.1 Design principles
 
-Each agent has one domain responsibility and one competency guard. The guard is a pure Python
-method — no LLM involved. The domain work is LLM-powered (except PolicyAgent which is deterministic
-Python).
+Each agent has one domain responsibility and one competency guard. The guard is pure Python — no
+LLM involved. The domain work is LLM-powered (except PolicyAgent).
 
 Each agent has three methods:
 
 - `is_competent_for(board)` — inspects the blackboard, returns the first proposal this agent
-  should work on, or `None`. This is the agent's self-activation condition. It is called by the
-  scheduler every cycle.
-- `get_instruction()` — returns the agent's stable identity and rules. Passed to `agent.run()` as
-  `instructions=`, which pydantic-ai sends as the system turn.
-- `get_prompt(proposal, deps)` — returns the live situational data for this specific activation.
-  Reads from the blackboard via `deps.board`. Passed as the user turn.
+  should work on, or `None`. Called by the scheduler every cycle.
+- `get_instruction()` — returns the agent's stable identity and rules. Passed as the system turn.
+- `get_prompt(proposal, deps)` — reads raw state from the board, applies local conflict reasoning,
+  and constructs the full situational context for this activation. Passed as the user turn.
 
-Each agent's `run()` method calls the LLM, receives a structured `Proposal` back, and writes it to
-the blackboard via `deps.board.update_proposal(proposal)`. The agent writes to the board itself —
-the scheduler does not do this on its behalf.
+Each agent's `run()` calls the LLM (or runs Python), receives a structured `Proposal` back, and
+writes it to the blackboard via `deps.board.update_proposal()`. The agent writes to the board
+itself — the Scheduler does not do this on its behalf.
 
-The sequential order of the pipeline is not declared anywhere explicitly. It emerges from the guard
-conditions: `CourseAgent` only finds proposals with no timeslot, so it always activates first.
-`RoomAgent` only finds proposals with a timeslot, so it always activates second. And so on.
+**Key change from v2.0:** `get_prompt()` no longer receives pre-filtered conflict lists. Each
+agent reads `deps.board.get_proposals()` and `deps.board.get_assignments()` directly and computes
+its own conflict view. The board's conflict methods are gone; that reasoning now lives here.
 
 ### 8.2 BaseAgent
 
@@ -502,11 +457,12 @@ class BaseAgent(ABC):
         self._name = name
         self._agent = agent
 
+    @property
+    def name(self) -> str:
+        return self._name
+
     @abstractmethod
-    def is_competent_for(self, board: BlackBoard) -> Proposal | None:
-        """Inspect the board and return the proposal this agent should work on,
-        or None if no current work is relevant to this agent's competency."""
-        ...
+    def is_competent_for(self, board: BlackBoard) -> Proposal | None: ...
 
     @abstractmethod
     def get_instruction(self) -> str: ...
@@ -521,17 +477,8 @@ class BaseAgent(ABC):
         """
 ```
 
-**Key points:**
-
-- `is_competent_for()` is abstract — every subclass must implement it. This is the defining method
-  of the Blackboard / Competency-Based Role pattern. It replaces external dispatch entirely.
-- `get_instruction()` is abstract — every subclass must implement it.
-- `get_prompt()` is **not** declared on the base. Each subclass defines it with its own typed
-  arguments. There is no meaningful shared signature.
-- `run()` is **not** declared on the base. Each agent's `run()` takes different arguments and has
-  different write-back behaviour.
-- `get_failure_prompt()` is concrete and shared. It formats the `failure_context` passed from the
-  scheduler when an agent re-activates after a policy rejection.
+`run()` and `get_prompt()` are not declared on the base. Each subclass defines them with its own
+typed arguments. There is no meaningful shared signature.
 
 ---
 
@@ -541,6 +488,8 @@ class BaseAgent(ABC):
 - **Competency**: Proposals with no timeslot set.
 - **Responsibility**: Propose the best timeslot for the course.
 - **Output type**: `Proposal` (with `timeslot` populated)
+- **Conflict reasoning**: reads all in-flight proposals and confirmed assignments from the board
+  directly; filters for timeslot conflicts itself.
 
 ```python
 import json
@@ -550,6 +499,7 @@ from agents.base_agent import BaseAgent
 from blackboard.blackboard import BlackBoard
 from core.deps import Deps
 from schemas.timetable import Proposal
+
 
 class CourseAgent(BaseAgent):
     def __init__(self, name: str, agent: Agent):
@@ -568,6 +518,7 @@ class CourseAgent(BaseAgent):
 
             - Timeslot must be on a valid school day, within school hours, not during lunch
             - Avoid timeslots already taken by confirmed assignments
+            - Avoid timeslots already claimed by other in-progress proposals
             - Spread courses across the week rather than clustering them
 
             Call log_decision to explain your reasoning. Return the proposal with timeslot set.
@@ -575,7 +526,19 @@ class CourseAgent(BaseAgent):
 
     def get_prompt(self, proposal: Proposal, deps: Deps) -> str:
         course = next(c for c in deps.courses if c.id == proposal.course_id)
-        assignments = deps.board.get_assignments()
+
+        confirmed_slots = [
+            a.timeslot.model_dump()
+            for a in deps.board.get_assignments()
+        ]
+
+        # agent reads raw proposals and computes its own conflict view
+        in_flight_slots = [
+            p.timeslot.model_dump()
+            for p in deps.board.get_proposals()
+            if p.id != proposal.id and p.timeslot is not None
+        ]
+
         prompt = f"""
             Course:
             {json.dumps(course.model_dump(), indent=2)}
@@ -583,8 +546,11 @@ class CourseAgent(BaseAgent):
             School policy:
             {json.dumps(deps.policy.model_dump(), indent=2)}
 
-            Already confirmed assignments (timeslots already taken):
-            {json.dumps([a.model_dump() for a in assignments], indent=2)}
+            Confirmed assignments (timeslots taken):
+            {json.dumps(confirmed_slots, indent=2)}
+
+            Timeslots already claimed by other in-progress proposals (avoid these too):
+            {json.dumps(in_flight_slots, indent=2)}
         """
         if proposal.failure_context:
             prompt += f"\n\n{self.get_failure_prompt(proposal.failure_context)}"
@@ -593,17 +559,8 @@ class CourseAgent(BaseAgent):
     async def run(self, proposal: Proposal, deps: Deps) -> None:
         prompt = self.get_prompt(proposal, deps)
         result = await self._agent.run(prompt, deps=deps, instructions=self.get_instruction())
-        updated = result.data
-        deps.board.update_proposal(updated)
+        deps.board.update_proposal(result.data)
 ```
-
-**Key difference from v1.0:** `run()` returns `None`. The agent writes the updated proposal
-directly to the blackboard via `deps.board.update_proposal()`. The scheduler does not handle
-write-back. The agent owns its own output.
-
-`failure_context` is read directly from the proposal on the board — the scheduler wrote it there
-after the policy rejection. The agent does not receive it as a parameter; it finds it on its
-proposal.
 
 ---
 
@@ -613,6 +570,8 @@ proposal.
 - **Competency**: Proposals with a timeslot but no room_id.
 - **Responsibility**: Assign the most suitable room.
 - **Output type**: `Proposal` (with `room_id` populated)
+- **Conflict reasoning**: reads all in-flight proposals and confirmed assignments; filters for
+  room conflicts at the proposal's timeslot itself.
 
 ```python
 import json
@@ -622,6 +581,7 @@ from agents.base_agent import BaseAgent
 from blackboard.blackboard import BlackBoard
 from core.deps import Deps
 from schemas.timetable import Proposal
+
 
 class RoomAgent(BaseAgent):
     def __init__(self, name: str, agent: Agent):
@@ -641,6 +601,7 @@ class RoomAgent(BaseAgent):
 
             - Match room type to course requirement (lab → lab room, non-lab → classroom)
             - Never assign a room already confirmed at the same timeslot
+            - Never assign a room already claimed by another in-progress proposal at the same timeslot
             - If multiple suitable rooms are free, prefer the best fit
 
             Call log_decision to explain your reasoning. Return the proposal with room_id set.
@@ -648,11 +609,23 @@ class RoomAgent(BaseAgent):
 
     def get_prompt(self, proposal: Proposal, deps: Deps) -> str:
         course = next(c for c in deps.courses if c.id == proposal.course_id)
-        booked_at_slot = [
-            a for a in deps.board.get_assignments()
-            if a.timeslot.day == proposal.timeslot.day
-            and a.timeslot.start_hour == proposal.timeslot.start_hour
+
+        # rooms confirmed at this timeslot — agent reads raw assignments and filters itself
+        confirmed_room_ids = [
+            a.room_id
+            for a in deps.board.get_assignments()
+            if a.timeslot == proposal.timeslot
         ]
+
+        # rooms claimed by other in-flight proposals at the same timeslot
+        in_flight_room_ids = [
+            p.room_id
+            for p in deps.board.get_proposals()
+            if p.id != proposal.id
+            and p.timeslot == proposal.timeslot
+            and p.room_id is not None
+        ]
+
         prompt = f"""
             Current proposal:
             {json.dumps(proposal.model_dump(), indent=2)}
@@ -663,8 +636,11 @@ class RoomAgent(BaseAgent):
             All rooms:
             {json.dumps([r.model_dump() for r in deps.rooms], indent=2)}
 
-            Rooms already confirmed at this timeslot:
-            {json.dumps([a.model_dump() for a in booked_at_slot], indent=2)}
+            Room ids confirmed at this timeslot (unavailable):
+            {json.dumps(confirmed_room_ids, indent=2)}
+
+            Room ids claimed by other in-progress proposals at this timeslot (unavailable):
+            {json.dumps(in_flight_room_ids, indent=2)}
         """
         if proposal.failure_context:
             prompt += f"\n\n{self.get_failure_prompt(proposal.failure_context)}"
@@ -673,8 +649,7 @@ class RoomAgent(BaseAgent):
     async def run(self, proposal: Proposal, deps: Deps) -> None:
         prompt = self.get_prompt(proposal, deps)
         result = await self._agent.run(prompt, deps=deps, instructions=self.get_instruction())
-        updated = result.data
-        deps.board.update_proposal(updated)
+        deps.board.update_proposal(result.data)
 ```
 
 ---
@@ -685,6 +660,8 @@ class RoomAgent(BaseAgent):
 - **Competency**: Proposals with a room_id but no lecturer_id.
 - **Responsibility**: Assign the most suitable lecturer.
 - **Output type**: `Proposal` (with `lecturer_id` populated)
+- **Conflict reasoning**: reads all in-flight proposals and confirmed assignments; filters for
+  lecturer conflicts at the proposal's timeslot itself.
 
 ```python
 import json
@@ -694,6 +671,7 @@ from agents.base_agent import BaseAgent
 from blackboard.blackboard import BlackBoard
 from core.deps import Deps
 from schemas.timetable import Proposal
+
 
 class LecturerAgent(BaseAgent):
     def __init__(self, name: str, agent: Agent):
@@ -714,6 +692,7 @@ class LecturerAgent(BaseAgent):
             - Lecturer must teach this course (check courses_taught)
             - Lecturer must not already be confirmed at this timeslot
             - Lecturer must not have this timeslot in their unavailable_slots
+            - Lecturer must not be claimed by another in-progress proposal at this timeslot
             - If multiple qualify, prefer the one with the lighter confirmed workload
 
             Call log_decision to explain your reasoning. Return the proposal with lecturer_id set.
@@ -721,11 +700,23 @@ class LecturerAgent(BaseAgent):
 
     def get_prompt(self, proposal: Proposal, deps: Deps) -> str:
         course = next(c for c in deps.courses if c.id == proposal.course_id)
-        booked_at_slot = [
-            a for a in deps.board.get_assignments()
-            if a.timeslot.day == proposal.timeslot.day
-            and a.timeslot.start_hour == proposal.timeslot.start_hour
+
+        # lecturer ids confirmed at this timeslot — agent reads raw and filters itself
+        confirmed_lecturer_ids = [
+            a.lecturer_id
+            for a in deps.board.get_assignments()
+            if a.timeslot == proposal.timeslot
         ]
+
+        # lecturer ids claimed by other in-flight proposals at the same timeslot
+        in_flight_lecturer_ids = [
+            p.lecturer_id
+            for p in deps.board.get_proposals()
+            if p.id != proposal.id
+            and p.timeslot == proposal.timeslot
+            and p.lecturer_id is not None
+        ]
+
         prompt = f"""
             Current proposal:
             {json.dumps(proposal.model_dump(), indent=2)}
@@ -736,8 +727,11 @@ class LecturerAgent(BaseAgent):
             All lecturers (includes courses_taught and unavailable_slots):
             {json.dumps([l.model_dump() for l in deps.lecturers], indent=2)}
 
-            Lecturers already confirmed at this timeslot:
-            {json.dumps([a.model_dump() for a in booked_at_slot], indent=2)}
+            Lecturer ids confirmed at this timeslot (unavailable):
+            {json.dumps(confirmed_lecturer_ids, indent=2)}
+
+            Lecturer ids claimed by other in-progress proposals at this timeslot (unavailable):
+            {json.dumps(in_flight_lecturer_ids, indent=2)}
         """
         if proposal.failure_context:
             prompt += f"\n\n{self.get_failure_prompt(proposal.failure_context)}"
@@ -746,8 +740,7 @@ class LecturerAgent(BaseAgent):
     async def run(self, proposal: Proposal, deps: Deps) -> None:
         prompt = self.get_prompt(proposal, deps)
         result = await self._agent.run(prompt, deps=deps, instructions=self.get_instruction())
-        updated = result.data
-        deps.board.update_proposal(updated)
+        deps.board.update_proposal(result.data)
 ```
 
 ---
@@ -758,11 +751,9 @@ class LecturerAgent(BaseAgent):
 - **Competency**: Proposals that are fully assembled but not yet policy-evaluated.
 - **Responsibility**: Check all policy rules. Set `policy_approved`, `policy_reason`, and
   `failed_component`. Write back to the board.
-- **Implementation**: Pure Python function — no LLM call.
-
-Policy checking is entirely deterministic. Every rule is a boolean condition on structured data.
-Using an LLM for this adds latency, cost, and the risk of arithmetic errors on hour comparisons.
-A Python function is faster, cheaper, and strictly more reliable.
+- **Implementation**: Pure Python — no LLM call.
+- **Conflict reasoning**: reads raw proposals from the board and computes room and lecturer
+  conflicts itself. No board helper methods.
 
 ```python
 from blackboard.blackboard import BlackBoard
@@ -770,10 +761,11 @@ from agents.base_agent import BaseAgent
 from core.deps import Deps
 from schemas.timetable import Proposal
 
+
 class PolicyAgent(BaseAgent):
     def __init__(self, name: str):
         self._name = name
-        self._agent = None      # no LLM — policy checking is deterministic Python
+        self._agent = None
 
     def is_competent_for(self, board: BlackBoard) -> Proposal | None:
         return next(
@@ -783,18 +775,18 @@ class PolicyAgent(BaseAgent):
         )
 
     def get_instruction(self) -> str:
-        return ""               # not used — no LLM
+        return ""
 
     def check(self, proposal: Proposal, deps: Deps) -> tuple[bool, str | None, str | None]:
         """
         Returns (approved, reason, failed_component).
         failed_component is one of "timeslot", "room", "lecturer", or None if approved.
         """
-        policy  = deps.policy
-        course  = next(c for c in deps.courses  if c.id == proposal.course_id)
-        room    = next(r for r in deps.rooms    if r.id == proposal.room_id)
+        policy   = deps.policy
+        course   = next(c for c in deps.courses   if c.id == proposal.course_id)
+        room     = next(r for r in deps.rooms     if r.id == proposal.room_id)
         lecturer = next(l for l in deps.lecturers if l.id == proposal.lecturer_id)
-        slot    = proposal.timeslot
+        slot     = proposal.timeslot
 
         if slot.day not in policy.school_days:
             return False, f"{slot.day} is not a valid school day", "timeslot"
@@ -817,6 +809,27 @@ class PolicyAgent(BaseAgent):
         ):
             return False, f"{lecturer.name} is unavailable at this timeslot", "lecturer"
 
+        # inter-proposal conflict checks — agent reads raw proposals itself
+        room_conflicts = [
+            p for p in deps.board.get_proposals()
+            if p.id != proposal.id
+            and p.room_id == proposal.room_id
+            and p.timeslot == proposal.timeslot
+        ]
+        if room_conflicts:
+            other = room_conflicts[0].course_id
+            return False, f"{room.name} already claimed by in-flight proposal for {other}", "room"
+
+        lecturer_conflicts = [
+            p for p in deps.board.get_proposals()
+            if p.id != proposal.id
+            and p.lecturer_id == proposal.lecturer_id
+            and p.timeslot == proposal.timeslot
+        ]
+        if lecturer_conflicts:
+            other = lecturer_conflicts[0].course_id
+            return False, f"{lecturer.name} already claimed by in-flight proposal for {other}", "lecturer"
+
         return True, None, None
 
     async def run(self, proposal: Proposal, deps: Deps) -> None:
@@ -826,11 +839,6 @@ class PolicyAgent(BaseAgent):
         proposal.failed_component = failed_component
         deps.board.update_proposal(proposal)
 ```
-
-**Note on `BaseAgent` inheritance:** `PolicyAgent` inherits `BaseAgent` to satisfy the scheduler's
-uniform interface — `is_competent_for()` is still defined and still called by the scheduler. The
-`agent` field is `None` because no pydantic-ai `Agent` is needed. `get_instruction()` returns an
-empty string and is never called.
 
 ---
 
@@ -851,107 +859,93 @@ empty string and is never called.
 
 ### 9.2 Scheduler loop
 
-The scheduler is a thin activation loop. It has no domain knowledge and makes no routing decisions.
-It asks each agent whether it is competent, activates the first one that is, and handles lifecycle
-operations (new proposal creation, confirmation, abandonment) that are not agent domain work.
+The Scheduler is a thin activation loop with lifecycle responsibility. It has no domain knowledge.
+It polls agents for competency, activates the first match, and handles proposal lifecycle
+transitions — confirmation, abandonment, and rejection reset. It owns the reset logic that was
+incorrectly placed in `Proposal.apply_rejection()` in v2.0.
 
 ```python
 MAX_CYCLES = 50
-MAX_RETRIES = 5
 
 class Scheduler:
     def __init__(self, agents: list[BaseAgent]):
-        self._agents = agents   # ordered: [CourseAgent, RoomAgent, LecturerAgent, PolicyAgent]
+        self._agents = agents
 
     async def run(self, deps: Deps) -> dict:
+        board = deps.board
         cycle = 0
 
         while cycle < MAX_CYCLES:
             cycle += 1
-            board = deps.board
-            logger.info(f"[cycle {cycle}] unscheduled: {board.get_unscheduled_courses()}")
-            logger.info(f"[cycle {cycle}] proposals in flight: {[p.id for p in board.get_proposals()]}")
+            logger.info(f"[cycle {cycle}] unscheduled={board.get_unscheduled_courses()} "
+                        f"in-flight={[p.id for p in board.get_proposals()]}")
 
-            # termination — nothing left to schedule
-            if not board.get_unscheduled_courses() and not board.get_proposals():
-                logger.info(f"[cycle {cycle}] all courses scheduled — done")
+            if board.is_complete():
+                logger.info(f"[cycle {cycle}] board complete — done")
                 break
 
-            # abandon any proposal that has exceeded MAX_RETRIES
-            for proposal in board.get_proposals():
+            for proposal in list(board.get_proposals()):
                 if proposal.retry_count >= MAX_RETRIES:
-                    logger.warning(f"[cycle {cycle}] abandoning {proposal.course_id} after {proposal.retry_count} retries")
+                    logger.warning(f"[cycle {cycle}] abandoning {proposal.course_id}")
                     board.abandon_proposal(proposal, "Exceeded MAX_RETRIES", cycle)
 
-            # handle approved proposals — confirm them
-            for proposal in board.get_proposals():
-                if proposal.policy_approved is True:
+                elif proposal.policy_approved is True:
                     logger.info(f"[cycle {cycle}] confirming {proposal.course_id}")
                     board.confirm_proposal(proposal, cycle)
 
-            # handle rejected proposals — reset the failed field, increment retry_count
-            for proposal in board.get_proposals():
-                if proposal.policy_approved is False:
-                    logger.info(
-                        f"[cycle {cycle}] policy rejected {proposal.course_id}: "
-                        f"{proposal.policy_reason} — resetting {proposal.failed_component}"
-                    )
-                    proposal.failure_context = proposal.policy_reason
-                    proposal.retry_count    += 1
-                    proposal.policy_approved = None
-                    proposal.policy_reason   = None
-                    # reset the failed field so the responsible agent re-activates
-                    if proposal.failed_component == "timeslot":
-                        proposal.timeslot    = None
-                        proposal.room_id     = None
-                        proposal.lecturer_id = None
-                    elif proposal.failed_component == "room":
-                        proposal.room_id     = None
-                        proposal.lecturer_id = None
-                    elif proposal.failed_component == "lecturer":
-                        proposal.lecturer_id = None
-                    proposal.failed_component = None
-                    board.update_proposal(proposal)
+                elif proposal.policy_approved is False:
+                    logger.info(f"[cycle {cycle}] resetting {proposal.course_id} "
+                                f"— failed: {proposal.failed_component}")
+                    self._reset_proposal(proposal, board)
 
-            # start a new proposal if a course has no proposal in flight yet
-            scheduled_ids = {p.course_id for p in board.get_proposals()}
-            for course_id in board.get_unscheduled_courses():
-                if course_id not in scheduled_ids:
-                    import uuid
-                    new_proposal = Proposal(id=str(uuid.uuid4()), course_id=course_id)
-                    board.add_proposal(new_proposal)
-                    logger.info(f"[cycle {cycle}] new proposal created for {course_id}")
-                    break   # one new proposal per cycle
+            board.ensure_proposals_exist(cycle)
 
-            # ask each agent if it is competent — activate the first match
-            activated = False
             for agent in self._agents:
-                proposal = agent.is_competent_for(board)
-                if proposal:
-                    logger.info(f"[cycle {cycle}] {agent._name} self-activated for {proposal.course_id}")
+                if proposal := agent.is_competent_for(board):
+                    logger.info(f"[cycle {cycle}] {agent.name} self-activated "
+                                f"for {proposal.course_id}")
                     await agent.run(proposal, deps)
-                    activated = True
                     break
 
-            if not activated:
-                logger.info(f"[cycle {cycle}] no agent activated this cycle")
-
         return self._produce_output(deps, cycle)
+
+    def _reset_proposal(self, proposal: Proposal, board: BlackBoard) -> None:
+        """Reset proposal fields to the stage that failed so the correct agent re-activates."""
+        if proposal.failed_component == "timeslot":
+            proposal.timeslot    = None
+            proposal.room_id     = None
+            proposal.lecturer_id = None
+        elif proposal.failed_component == "room":
+            proposal.room_id     = None
+            proposal.lecturer_id = None
+        elif proposal.failed_component == "lecturer":
+            proposal.lecturer_id = None
+
+        proposal.failure_context  = proposal.policy_reason
+        proposal.retry_count     += 1
+        proposal.policy_approved  = None
+        proposal.policy_reason    = None
+        proposal.failed_component = None
+
+        board.update_proposal(proposal)
+
+    def _produce_output(self, deps: Deps, cycle: int) -> dict:
+        # joins assignments with course, room, lecturer names from reference data
+        # joins remaining unscheduled courses with rejection log for reason reporting
+        ...
 ```
 
-**What the scheduler does:**
-
+**What the Scheduler does:**
 - Checks termination
 - Abandons proposals that exceed `MAX_RETRIES`
 - Confirms proposals the `PolicyAgent` has approved
-- Resets rejected proposals so the correct agent re-activates
+- Resets rejected proposals via `_reset_proposal()` so the correct agent re-activates
 - Creates new proposals for unscheduled courses
 - Polls agents for competency and activates the first match
 
-**What the scheduler does not do:**
-
-- It does not choose which agent to call for domain work
-- It does not interpret proposal state to make routing decisions
+**What the Scheduler does not do:**
+- It does not choose which agent handles domain work
+- It does not interpret proposal content to make routing decisions
 - It does not know what a timeslot, room, or lecturer is
 - It does not pass context between agents
 
@@ -959,17 +953,9 @@ class Scheduler:
 
 | Condition | Outcome |
 |---|---|
-| No unscheduled courses and no in-flight proposals | Success — full timetable produced |
-| Proposal `retry_count >= MAX_RETRIES` | That course abandoned, removed from board |
-| `cycle > MAX_CYCLES` | Partial result — report what was scheduled and what remains |
-
-### 9.4 Output
-
-```python
-def _produce_output(self, deps: Deps, cycle: int) -> dict:
-    # joins assignments with course, room, lecturer names from reference data
-    # joins remaining unscheduled courses with rejection log for reason reporting
-```
+| No unscheduled courses and no in-flight proposals | Success |
+| Proposal `retry_count >= MAX_RETRIES` | That course abandoned |
+| `cycle > MAX_CYCLES` | Partial result |
 
 ---
 
@@ -981,15 +967,11 @@ def _produce_output(self, deps: Deps, cycle: int) -> dict:
 
 ```python
 import logging
-
 logger = logging.getLogger("timetable")
 ```
 
-One named logger. All modules import this and call `logger.info(...)` or `logger.warning(...)`
-directly at the call site. No wrapper functions.
-
-The `log_decision` tool in `tools/agent_logger.py` uses its own `logging.getLogger(__name__)` as
-before.
+One named logger. All modules import this directly. The `log_decision` tool uses its own
+`logging.getLogger(__name__)`.
 
 ### 10.2 LLM Factory
 
@@ -1000,8 +982,8 @@ def make_model(provider: str) -> KnownModelName | Model:
     ...
 ```
 
-Accepts a string like `"openai:gpt-4o-mini"` or `"anthropic:claude-haiku-3-5"` and returns a
-configured pydantic-ai model object. Unchanged from v1.0.
+Accepts a string like `"openai:gpt-4o-mini"` and returns a configured pydantic-ai model object.
+Unchanged from v2.0.
 
 ### 10.3 Data Loader
 
@@ -1016,13 +998,13 @@ def load_data() -> tuple[list[Course], list[Room], list[Lecturer], Policy]:
     return courses, rooms, lecturers, policy
 ```
 
-Unchanged from v1.0.
+Unchanged from v2.0.
 
 ---
 
 ## 11. Data Files
 
-Identical to v1.0. No changes.
+Identical to v2.0. No changes.
 
 ### courses.json
 ```json
@@ -1086,8 +1068,6 @@ Identical to v1.0. No changes.
 ---
 
 ## 12. Output Format
-
-Identical to v1.0.
 
 ### Success
 ```json
@@ -1188,90 +1168,81 @@ async def main():
 asyncio.run(main())
 ```
 
-**Differences from v1.0:**
-
-- `OrchestratorAgent` import and instantiation removed entirely
-- `Store` replaced by `BlackBoard`
-- `Coordinator` replaced by `Scheduler`
-- `agents` is now a `list` ordered by activation priority, not a `dict` keyed by name —
-  order matters because the scheduler polls them in sequence
-- `PolicyAgent` receives only `name` — no pydantic-ai `Agent` needed
-- Provider defaults to `gpt-4o-mini` — smaller model appropriate for these tasks
+Unchanged from v2.0.
 
 ---
 
 ## 14. MAS Patterns Applied
 
-```markdown
-## MAS Patterns Applied
-
 ### Coordination Patterns
-- Blackboard — BlackBoard is the shared knowledge base; all agents read and write directly;
-  no coordinator mediates access
-- Competency-Based Role — each agent defines its own activation condition (is_competent_for);
+- **Blackboard** — `BlackBoard` is the shared knowledge base; all agents read and write directly;
+  the board holds raw state only, no domain logic
+- **Competency-Based Role** — each agent defines its own activation condition (`is_competent_for`);
   role = domain competency + guard condition + reaction, not just a label
-- Sequential Pipeline (emergent) — timeslot → room → lecturer → policy order is not declared;
+- **Sequential Pipeline (emergent)** — timeslot → room → lecturer → policy order is not declared;
   it emerges from each agent's guard conditions on proposal field readiness
-- Planner-Generator-Evaluator — scheduler resets failed fields (plan), agent regenerates with
-  failure_context (generate), PolicyAgent re-evaluates (evaluate); loop until approved or abandoned
+- **Planner-Generator-Evaluator** — scheduler resets failed fields (plan), agent regenerates with
+  `failure_context` (generate), `PolicyAgent` re-evaluates (evaluate); loop until approved or abandoned
 
 ### Communication Mechanism
-- Blackboard (read/write) — agents communicate exclusively by reading from and writing to the
-  shared BlackBoard; no direct agent-to-agent calls; no message passing
-```
+- **Blackboard (read/write)** — agents communicate exclusively by reading from and writing to the
+  shared `BlackBoard`; no direct agent-to-agent calls; no message passing
+
+### Responsibility boundaries (v3.0 clarification)
+
+| Component | Owns |
+|---|---|
+| `BlackBoard` | Raw state storage and retrieval only |
+| `Proposal` | Data shape only — no methods, no mutation |
+| Each Agent | Its own conflict reasoning, context assembly, domain decision |
+| `Scheduler` | Proposal lifecycle: confirm, abandon, reset on rejection |
 
 ---
 
 ## 15. Implementation Sequence
 
-Build and verify in this order. Each phase has a verification step — do not proceed to the next
-phase until verification passes.
+Build and verify in this order.
 
 **Phase 1 — Schemas** (`schemas/`)
 All Pydantic models. Verify by instantiating each with dummy data and round-tripping through
-`model_dump()` / `model_validate()`. Confirm `failed_component` and `failure_context` default to
-`None` on `Proposal`.
+`model_dump()` / `model_validate()`. Confirm `Proposal` has no methods beyond Pydantic defaults.
 
 **Phase 2 — BlackBoard** (`blackboard/blackboard.py`)
-Seed, add_proposal, update_proposal, confirm_proposal, abandon_proposal, all four reads. Verify
-with a standalone script: seed three courses, add two proposals, update one, confirm one, abandon
-one. Print all collections after each operation and confirm state is correct.
+Seed, add_proposal, update_proposal, confirm_proposal, abandon_proposal, all four read methods.
+Verify with a standalone script: seed three courses, add two proposals, update one, confirm one,
+abandon one. Confirm no conflict methods exist on the board.
 
 **Phase 3 — Core infrastructure** (`core/`)
 `deps.py`, `llm_factory.py`, `data_loader.py`, `logger.py`. Verify by loading data files and
-printing parsed models. Confirm `Deps.board` accepts a `BlackBoard` instance.
+printing parsed models.
 
 **Phase 4 — Data files** (`data/`)
-Copy the four JSON files from section 11. Verify by running `load_data()` and confirming all
-models parse without error.
+Copy the four JSON files from section 11. Verify by running `load_data()`.
 
 **Phase 5 — Tools** (`tools/agent_logger.py`)
 The single `log_decision` tool. Verify by instantiating a minimal pydantic-ai agent with this tool
-and confirming a log line appears with a non-zero token count on first call.
+and confirming a log line appears with a non-zero token count.
 
 **Phase 6 — PolicyAgent** (`agents/policy_agent.py`)
-Build first because it has no LLM dependency and its `check()` method is directly testable. Verify
-by calling `check()` directly with a manually constructed proposal, course, room, lecturer, and
-policy — test each failure branch (invalid day, outside hours, lunch overlap, wrong room type,
-unqualified lecturer, unavailable lecturer) and the success path. Confirm `failed_component` is set
-correctly for each branch.
+Build first — no LLM dependency. Verify `check()` directly: test each failure branch (invalid day,
+outside hours, lunch overlap, wrong room type, unqualified lecturer, unavailable lecturer,
+inter-proposal room conflict, inter-proposal lecturer conflict) and the success path. Confirm
+`failed_component` is set correctly for each branch. Confirm all conflict detection reads raw
+proposals from the board, not from board helper methods.
 
 **Phase 7 — Worker agents** (`agents/`)
-Build in this order: `RoomAgent` → `LecturerAgent` → `CourseAgent`. For each: verify
-`is_competent_for()` returns the correct proposal given a board with proposals in various states,
-and returns `None` when no proposal matches its guard. Then call `run()` with a minimal board and
-deps, confirm the agent writes an updated proposal back to the board with the expected field
-populated.
+Build in order: `RoomAgent` → `LecturerAgent` → `CourseAgent`. For each: verify
+`is_competent_for()` returns the correct proposal given a board with proposals in various states.
+Verify `get_prompt()` reads raw board state and assembles its own conflict view. Call `run()` with
+a minimal board and deps and confirm the agent writes an updated proposal back to the board.
 
 **Phase 8 — Scheduler** (`control/scheduler.py`)
-Build after all agents are verified. Test the activation loop in isolation: construct a board with
-proposals at each stage and confirm the correct agent self-activates each cycle. Then test the full
-happy path end-to-end — all four courses should confirm. Then test failure recovery by temporarily
-making a constraint impossible (e.g. remove all lab rooms) and confirming proposals are abandoned
-after MAX_RETRIES.
+Build after all agents are verified. Test `_reset_proposal()` in isolation for each
+`failed_component` value. Test the full activation loop: construct a board with proposals at each
+stage and confirm the correct agent self-activates each cycle. Test happy path end-to-end. Test
+failure recovery by making a constraint impossible and confirming abandonment after MAX_RETRIES.
 
 **Phase 9 — Integration** (`main.py`)
-Run end-to-end. Observe log output to confirm: no orchestrator is called, agents self-activate
-in the correct order, `log_decision` lines appear with non-zero tokens for LLM agents,
-`PolicyAgent` produces no token lines (it makes no LLM calls), final output includes `total_tokens`
-reflecting cumulative cost from the three LLM agents only.
+Run end-to-end. Confirm: no orchestrator called, agents self-activate in correct order,
+`log_decision` lines appear with non-zero tokens for LLM agents, `PolicyAgent` produces no token
+lines, final output includes `total_tokens` from the three LLM agents only.

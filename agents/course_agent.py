@@ -14,8 +14,7 @@ class CourseAgent(BaseAgent):
 
     def is_competent_for(self, board: BlackBoard) -> Proposal | None:
         return next(
-            (p for p in board.get_proposals() if p.timeslot is None),
-            None,
+            (p for p in board.get_proposals() if p.timeslot is None), None,
         )
 
     def get_instruction(self) -> str:
